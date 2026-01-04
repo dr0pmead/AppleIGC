@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="media/logo.png" width="400" alt="AppleIGC Logo">
+  <img src="media/logo.png" width="100%" alt="AppleIGC Logo">
 </p>
 
 # AppleIGC
