@@ -1,7 +1,9 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOMapper.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/network/IOEthernetController.h>
@@ -393,6 +395,243 @@ static void igc_get_hw_control(struct igc_adapter *adapter) {
   wr32(IGC_CTRL_EXT, ctrl_ext | IGC_CTRL_EXT_DRV_LOAD);
 }
 
+#define IGC_DESC_RING_ALIGN 128
+#define IGC_TX_BOUNCE_SIZE (256 * 1024)
+#define IGC_TX_BOUNCE_MIN_SIZE (64 * 1024)
+#define IGC_TX_BOUNCE_ALIGN 64
+#define IGC_TX_BOUNCE_MAX_FRAME (65536 + ETH_HLEN + VLAN_HLEN)
+
+/*
+ * Every address handed to the NIC must come from the device's own IOMapper.
+ * IOMemoryDescriptor::getPhysicalAddress() and IOMbufMemoryCursor return
+ * host physical or system-mapper addresses, which are not valid for the
+ * i225 once VT-d gives it a translation domain of its own.
+ */
+static IOReturn igc_dma_map(IOMemoryDescriptor *md, IOMapper *mapper,
+                            UInt64 align, IODMACommand **cmdOut,
+                            dma_addr_t *dmaOut) {
+  IODMACommand::Segment64 seg;
+  UInt64 len = md->getLength();
+  UInt64 offset = 0;
+  UInt32 numSeg = 1;
+  IOReturn ret;
+
+  // 64 address bits and byte alignment keep IODMACommand from substituting a
+  // bounce copy: rings are shared with the device and must never be copied.
+  IODMACommand *cmd = IODMACommand::withSpecification(
+      kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, mapper,
+      NULL);
+  if (!cmd)
+    return kIOReturnNoMemory;
+
+  ret = cmd->setMemoryDescriptor(md, false);
+  if (ret == kIOReturnSuccess)
+    ret = cmd->prepare(0, len);
+  if (ret == kIOReturnSuccess)
+    ret = cmd->gen64IOVMSegments(&offset, &seg, &numSeg);
+  if (ret == kIOReturnSuccess &&
+      (numSeg != 1 || offset != len || seg.fLength != len ||
+       (seg.fIOVMAddr & (align - 1))))
+    ret = kIOReturnUnsupported;
+
+  if (ret != kIOReturnSuccess) {
+    cmd->clearMemoryDescriptor(true);
+    cmd->release();
+    return ret;
+  }
+
+  *cmdOut = cmd;
+  *dmaOut = seg.fIOVMAddr;
+  return kIOReturnSuccess;
+}
+
+static void igc_dma_unmap(IODMACommand **cmd) {
+  if (*cmd) {
+    (*cmd)->clearMemoryDescriptor(true);
+    (*cmd)->release();
+    *cmd = NULL;
+  }
+}
+
+static void igc_dma_log(const char *what, int index, IOMemoryDescriptor *md,
+                        dma_addr_t dma) {
+  pr_err("%s %d: iova 0x%llx, legacy 0x%llx, host 0x%llx, len %llu\n", what,
+         index, (unsigned long long)dma,
+         (unsigned long long)md->getPhysicalAddress(),
+         (unsigned long long)md->getPhysicalSegment(0, NULL,
+                                                    kIOMemoryMapperNone),
+         (unsigned long long)md->getLength());
+}
+
+/* Expects ring->pool allocated; releases it on failure. */
+static int igc_map_desc_ring(struct igc_ring *ring, const char *what) {
+  IOReturn ret = ring->pool->prepare();
+
+  if (ret == kIOReturnSuccess) {
+    ret = igc_dma_map(ring->pool, ring->netdev->mapper(), IGC_DESC_RING_ALIGN,
+                      &ring->pool_cmd, &ring->dma);
+    if (ret != kIOReturnSuccess)
+      ring->pool->complete();
+  }
+  if (ret != kIOReturnSuccess) {
+    pr_err("Failed to map %s %d for DMA: 0x%x\n", what, ring->queue_index,
+           ret);
+    RELEASE(ring->pool);
+    return -ENOMEM;
+  }
+
+  ring->desc = ring->pool->getBytesNoCopy();
+  memset(ring->desc, 0, ring->size);
+  igc_dma_log(what, ring->queue_index, ring->pool, ring->dma);
+  return 0;
+}
+
+static void igc_unmap_desc_ring(struct igc_ring *ring) {
+  igc_dma_unmap(&ring->pool_cmd);
+  if (ring->pool) {
+    ring->pool->complete();
+    RELEASE(ring->pool);
+  }
+  ring->desc = NULL;
+  ring->dma = 0;
+}
+
+static void igc_tx_bounce_reset(struct igc_ring *tx_ring) {
+  tx_ring->tx_bounce_head = 0;
+  tx_ring->tx_bounce_alloc = 0;
+  __atomic_store_n(&tx_ring->tx_bounce_freed, 0, __ATOMIC_RELEASE);
+}
+
+static int igc_tx_bounce_setup(struct igc_ring *tx_ring) {
+  IOBufferMemoryDescriptor *md = NULL;
+  IOReturn ret = kIOReturnNoMemory;
+  u32 size;
+
+  /* Without an IOMMU one DMA segment needs physically contiguous memory,
+   * which may be scarce after long uptime: settle for less if needed. */
+  for (size = IGC_TX_BOUNCE_SIZE; size >= IGC_TX_BOUNCE_MIN_SIZE; size /= 2) {
+    md = IOBufferMemoryDescriptor::inTaskWithOptions(
+        kernel_task, kIODirectionOut | kIOMemoryPhysicallyContiguous, size,
+        PAGE_SIZE);
+    if (md)
+      break;
+  }
+
+  if (md) {
+    ret = md->prepare();
+    if (ret == kIOReturnSuccess) {
+      ret = igc_dma_map(md, tx_ring->netdev->mapper(), 1,
+                        &tx_ring->tx_bounce_cmd, &tx_ring->tx_bounce_dma);
+      if (ret != kIOReturnSuccess)
+        md->complete();
+    }
+  }
+  if (ret != kIOReturnSuccess) {
+    pr_err("Failed to set up TX bounce buffer %d: 0x%x\n",
+           tx_ring->queue_index, ret);
+    RELEASE(md);
+    return -ENOMEM;
+  }
+
+  tx_ring->tx_bounce = md;
+  tx_ring->tx_bounce_va = (u8 *)md->getBytesNoCopy();
+  tx_ring->tx_bounce_size = size;
+  igc_tx_bounce_reset(tx_ring);
+  igc_dma_log("tx bounce", tx_ring->queue_index, md, tx_ring->tx_bounce_dma);
+  return 0;
+}
+
+static void igc_tx_bounce_free(struct igc_ring *tx_ring) {
+  igc_dma_unmap(&tx_ring->tx_bounce_cmd);
+  if (tx_ring->tx_bounce) {
+    tx_ring->tx_bounce->complete();
+    RELEASE(tx_ring->tx_bounce);
+  }
+  tx_ring->tx_bounce_va = NULL;
+  tx_ring->tx_bounce_dma = 0;
+  tx_ring->tx_bounce_size = 0;
+}
+
+struct igc_tx_bounce_slot {
+  u32 offset;    /* where the frame is copied to */
+  u32 consumed;  /* bytes taken from the FIFO, including wrap padding */
+  u32 prev_head; /* for igc_tx_bounce_unget() */
+};
+
+/*
+ * Frames complete in submission order, so the bounce buffer is a byte FIFO.
+ * A frame never wraps: if it does not fit before the end, the tail is
+ * skipped as padding and the frame starts at offset 0.
+ */
+static bool igc_tx_bounce_place(struct igc_ring *tx_ring, u32 len, u32 *offset,
+                                u32 *consumed) {
+  u32 size = tx_ring->tx_bounce_size;
+  u32 need = ALIGN(len, IGC_TX_BOUNCE_ALIGN);
+  u32 used = tx_ring->tx_bounce_alloc -
+             __atomic_load_n(&tx_ring->tx_bounce_freed, __ATOMIC_ACQUIRE);
+  u32 head = used ? tx_ring->tx_bounce_head : 0;
+  u32 off, pad;
+
+  if (!len || need > size)
+    return false;
+
+  if (head + need <= size) {
+    off = head;
+    pad = 0;
+  } else {
+    off = 0;
+    pad = size - head;
+  }
+  if (pad + need > size - used)
+    return false;
+
+  *offset = off;
+  *consumed = pad + need;
+  return true;
+}
+
+static bool igc_tx_bounce_has_room(struct igc_ring *tx_ring, u32 len) {
+  u32 offset, consumed;
+
+  return igc_tx_bounce_place(tx_ring, len, &offset, &consumed);
+}
+
+static bool igc_tx_bounce_get(struct igc_ring *tx_ring, u32 len,
+                              struct igc_tx_bounce_slot *slot) {
+  if (!igc_tx_bounce_place(tx_ring, len, &slot->offset, &slot->consumed))
+    return false;
+
+  slot->prev_head = tx_ring->tx_bounce_head;
+  tx_ring->tx_bounce_head =
+      (slot->offset + ALIGN(len, IGC_TX_BOUNCE_ALIGN)) % tx_ring->tx_bounce_size;
+  tx_ring->tx_bounce_alloc += slot->consumed;
+  return true;
+}
+
+/* Only valid before the frame was handed to the hardware. */
+static void igc_tx_bounce_unget(struct igc_ring *tx_ring,
+                                const struct igc_tx_bounce_slot *slot) {
+  tx_ring->tx_bounce_head = slot->prev_head;
+  tx_ring->tx_bounce_alloc -= slot->consumed;
+}
+
+static void igc_tx_bounce_put(struct igc_ring *tx_ring, u32 consumed) {
+  __atomic_store_n(&tx_ring->tx_bounce_freed,
+                   tx_ring->tx_bounce_freed + consumed, __ATOMIC_RELEASE);
+}
+
+/* Must run after igc_tso()/igc_tx_csum(): they rewrite headers in the mbuf. */
+static bool igc_tx_bounce_fill(struct igc_ring *tx_ring, mbuf_t skb, u32 len,
+                               const struct igc_tx_bounce_slot *slot,
+                               struct IOPhysicalSegment *vec) {
+  if (mbuf_copydata(skb, 0, len, tx_ring->tx_bounce_va + slot->offset) != 0)
+    return false;
+
+  vec->location = tx_ring->tx_bounce_dma + slot->offset;
+  vec->length = len;
+  return true;
+}
+
 static void igc_unmap_tx_buffer(struct device *dev, struct igc_tx_buffer *buf) {
 #ifndef __APPLE__
   dma_unmap_single(dev, dma_unmap_addr(buf, dma), dma_unmap_len(buf, len),
@@ -418,6 +657,9 @@ void igc_unmap_and_free_tx_resource(struct igc_ring *ring,
   }
   tx_buffer->next_to_watch = NULL;
   tx_buffer->skb = NULL;
+#ifdef __APPLE__
+  tx_buffer->bounce_len = 0;
+#endif
   dma_unmap_len_set(tx_buffer, len, 0);
   /* buffer_info must be completely set up in the transmit path */
 }
@@ -452,6 +694,9 @@ static void igc_clean_tx_ring(struct igc_ring *tx_ring) {
 
   tx_ring->next_to_use = 0;
   tx_ring->next_to_clean = 0;
+#ifdef __APPLE__
+  igc_tx_bounce_reset(tx_ring);
+#endif
 }
 
 /**
@@ -463,18 +708,15 @@ static void igc_clean_tx_ring(struct igc_ring *tx_ring) {
 void igc_free_tx_resources(struct igc_ring *tx_ring) {
   igc_clean_tx_ring(tx_ring);
 
-  vfree(tx_ring->tx_buffer_info, sizeof(struct igc_rx_buffer) * tx_ring->count);
+  vfree(tx_ring->tx_buffer_info, sizeof(struct igc_tx_buffer) * tx_ring->count);
   tx_ring->tx_buffer_info = NULL;
 
   /* if not set, then don't free */
   if (!tx_ring->desc)
     return;
 #ifdef __APPLE__
-  if (tx_ring->pool) {
-    tx_ring->pool->complete();
-    tx_ring->pool->release();
-    tx_ring->pool = NULL;
-  }
+  igc_tx_bounce_free(tx_ring);
+  igc_unmap_desc_ring(tx_ring);
 #else
   dma_free_coherent(tx_ring->dev, tx_ring->size, tx_ring->desc, tx_ring->dma);
 #endif
@@ -530,9 +772,12 @@ int igc_setup_tx_resources(struct igc_ring *tx_ring) {
 
   if (!tx_ring->pool)
     goto err;
-  tx_ring->pool->prepare();
-  tx_ring->desc = tx_ring->pool->getBytesNoCopy();
-  tx_ring->dma = tx_ring->pool->getPhysicalAddress();
+  if (igc_map_desc_ring(tx_ring, "tx ring"))
+    goto err;
+  if (igc_tx_bounce_setup(tx_ring)) {
+    igc_unmap_desc_ring(tx_ring);
+    goto err;
+  }
 #else
   tx_ring->desc =
       dma_alloc_coherent(dev, tx_ring->size, &tx_ring->dma, GFP_KERNEL);
@@ -548,6 +793,7 @@ int igc_setup_tx_resources(struct igc_ring *tx_ring) {
 
 err:
   vfree(tx_ring->tx_buffer_info, size);
+  tx_ring->tx_buffer_info = NULL;
   netdev_err(ndev, "Unable to allocate memory for Tx descriptor ring\n");
   return -ENOMEM;
 }
@@ -595,8 +841,13 @@ static void igc_clean_rx_ring_page_shared(struct igc_ring *rx_ring) {
      * device so that we avoid corrupting memory.
      */
 #ifdef __APPLE__
-    buffer_info->page->complete();
-    buffer_info->page->release();
+    if (buffer_info->page) {
+      igc_dma_unmap(&buffer_info->dma_cmd);
+      buffer_info->page->complete();
+      buffer_info->page->release();
+      buffer_info->page = NULL;
+      buffer_info->dma = 0;
+    }
 #else
     dma_sync_single_range_for_cpu(rx_ring->dev, buffer_info->dma,
                                   buffer_info->page_offset,
@@ -659,11 +910,7 @@ void igc_free_rx_resources(struct igc_ring *rx_ring) {
   if (!rx_ring->desc)
     return;
 #ifdef __APPLE__
-  if (rx_ring->pool) {
-    rx_ring->pool->complete();
-    rx_ring->pool->release();
-    rx_ring->pool = NULL;
-  }
+  igc_unmap_desc_ring(rx_ring);
 #else
   dma_free_coherent(rx_ring->dev, rx_ring->size, rx_ring->desc, rx_ring->dma);
 #endif
@@ -711,9 +958,8 @@ int igc_setup_rx_resources(struct igc_ring *rx_ring) {
 
   if (!rx_ring->pool)
     goto err;
-  rx_ring->pool->prepare();
-  rx_ring->desc = rx_ring->pool->getBytesNoCopy();
-  rx_ring->dma = rx_ring->pool->getPhysicalAddress();
+  if (igc_map_desc_ring(rx_ring, "rx ring"))
+    goto err;
 #else
   rx_ring->desc =
       dma_alloc_coherent(dev, rx_ring->size, &rx_ring->dma, GFP_KERNEL);
@@ -776,6 +1022,18 @@ static void igc_configure_rx_ring(struct igc_adapter *adapter,
 
   /* disable the queue */
   wr32(IGC_RXDCTL(reg_idx), 0);
+
+#ifdef __APPLE__
+  /* setLinkUp() reconfigures right after igc_open() without igc_down(), so
+   * the pages posted by igc_open() are still owned here; the memset below
+   * would leak them together with their IOMMU mappings. */
+  if (ring->next_to_clean != ring->next_to_alloc) {
+    wrfl();
+    mdelay(10);
+    igc_clean_rx_ring_page_shared(ring);
+    ring->next_to_alloc = 0;
+  }
+#endif
 
   /* Set DMA base address registers */
   wr32(IGC_RDBAL(reg_idx), rdba & 0x00000000ffffffffULL);
@@ -2014,6 +2272,14 @@ static void igc_reuse_rx_page(struct igc_ring *rx_ring,
   new_buff->page = old_buff->page;
   new_buff->page_offset = old_buff->page_offset;
   // new_buff->pagecnt_bias    = old_buff->pagecnt_bias;
+#ifdef __APPLE__
+  /* the page and its device mapping move together; old_buff gives up both */
+  new_buff->dma_cmd = old_buff->dma_cmd;
+  if (new_buff != old_buff) {
+    old_buff->page = NULL;
+    old_buff->dma_cmd = NULL;
+  }
+#endif
 }
 #ifndef __APPLE__
 static bool igc_can_reuse_rx_page(struct igc_rx_buffer *rx_buffer,
@@ -2157,18 +2423,21 @@ static inline unsigned int igc_rx_offset(struct igc_ring *rx_ring) {
 static bool igc_alloc_mapped_page(struct igc_ring *rx_ring,
                                   struct igc_rx_buffer *bi) {
 #ifdef __APPLE__
-  dma_addr_t dma;
+  IOBufferMemoryDescriptor *page;
+  IODMACommand *cmd = NULL;
+  dma_addr_t dma = 0;
+  IOReturn ret;
 
   /* since we are recycling buffers we should seldom need to alloc */
   if (likely(bi->page))
     return true;
 
   /* alloc new page for storage */
-  bi->page = IOBufferMemoryDescriptor::inTaskWithOptions(
+  page = IOBufferMemoryDescriptor::inTaskWithOptions(
       kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, PAGE_SIZE,
       PAGE_SIZE);
 
-  if (unlikely(!bi->page)) {
+  if (unlikely(!page)) {
     pr_err(
         "Failed to alloc new page for storage from IOBufferMemoryDescriptor\n");
     rx_ring->rx_stats.alloc_failed++;
@@ -2176,9 +2445,24 @@ static bool igc_alloc_mapped_page(struct igc_ring *rx_ring,
   }
 
   /* map page for use */
-  bi->page->prepare();
-  dma = bi->page->getPhysicalAddress();
+  ret = page->prepare();
+  if (likely(ret == kIOReturnSuccess)) {
+    ret = igc_dma_map(page, rx_ring->netdev->mapper(), 2, &cmd, &dma);
+    if (unlikely(ret != kIOReturnSuccess))
+      page->complete();
+  }
+  if (unlikely(ret != kIOReturnSuccess)) {
+    pr_err("Failed to map RX page for DMA: 0x%x\n", ret);
+    page->release();
+    rx_ring->rx_stats.alloc_failed++;
+    return false;
+  }
 
+  if (bi == rx_ring->rx_buffer_info)
+    igc_dma_log("rx page", rx_ring->queue_index, page, dma);
+
+  bi->page = page;
+  bi->dma_cmd = cmd;
   bi->dma = dma;
 #else /** __APPLE__ */
   struct page *page = bi->page;
@@ -2356,9 +2640,6 @@ static struct sk_buff *igc_fetch_rx_buffer(struct igc_ring *rx_ring,
   }
   igc_reuse_rx_page(rx_ring, rx_buffer);
 
-  /* clear contents of rx_buffer */
-  rx_buffer->page = NULL;
-
   return skb;
 }
 
@@ -2521,6 +2802,11 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget) {
       adapter->netdev->freePacket(tx_buffer->skb);
     }
     tx_buffer->skb = NULL;
+
+    if (tx_buffer->bounce_len) {
+      igc_tx_bounce_put(tx_ring, tx_buffer->bounce_len);
+      tx_buffer->bounce_len = 0;
+    }
 
     switch (tx_buffer->type) {
     case IGC_TX_BUFFER_TYPE_XSK:
@@ -5576,6 +5862,7 @@ bool AppleIGC::init(OSDictionary *properties) {
   workLoop = NULL;
 
   pdev = NULL;
+  dmaMapper = NULL;
   mediumDict = NULL;
   csrPCIAddress = NULL;
   interruptSource = NULL;
@@ -5618,6 +5905,7 @@ void AppleIGC::igc_remove() {
 
 void AppleIGC::free() {
   RELEASE(mediumDict);
+  RELEASE(dmaMapper);
 
   super::free();
 #ifdef APPLE_OS_LOG
@@ -5873,6 +6161,13 @@ bool AppleIGC::start(IOService *provider) {
   pdev->retain();
   if (pdev->open(this) == false)
     return false;
+
+  // NULL (no "iommu-parent"): mapper() passes pdev instead, IODMACommand then
+  // uses the system mapper, or host physical addresses without an IOMMU.
+  dmaMapper = IOMapper::copyMapperForDevice(pdev);
+  pr_err("DMA mapper: device %s (%p), system %p\n",
+         dmaMapper ? dmaMapper->getName() : "none (system mapper for pdev)",
+         dmaMapper, IOMapper::gSystem);
 
 #ifdef NETIF_F_TSO
   useTSO = FALSE; // getBoolOption("NETIF_F_TSO", TRUE);
@@ -6343,7 +6638,11 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
   struct igc_adapter *adapter = &priv_adapter;
   struct igc_ring *tx_ring = igc_tx_queue_mapping(adapter, skb);
   mbuf_t skb = NULL;
+  /* checked before dequeueing: a dequeued frame cannot be handed back */
+  u32 maxFrame = useTSO ? IGC_TX_BOUNCE_MAX_FRAME
+                        : _mtu + ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN;
   while ((txNumFreeDesc = igc_desc_unused(tx_ring)) >= (MAX_SKB_FRAGS + 3) &&
+         igc_tx_bounce_has_room(tx_ring, maxFrame) &&
          kIOReturnSuccess ==
              interface->dequeueOutputPackets(1, &skb, NULL, NULL, NULL)) {
     if (!(mbuf_flags(skb) & M_PKTHDR)) {
@@ -6356,28 +6655,25 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
     int tso = 0;
     u32 tx_flags = 0;
     u8 hdr_len = 0;
+    u32 len = (u32)mbuf_pkthdr_len(skb);
+    struct igc_tx_bounce_slot slot;
+    struct IOPhysicalSegment vec[1];
 
-    struct IOPhysicalSegment vec[MAX_SKB_FRAGS];
-    UInt32 frags =
-        txMbufCursor->getPhysicalSegmentsWithCoalesce(skb, vec, MAX_SKB_FRAGS);
-    if (frags == 0) {
-      pr_debug("No frags by getPhysicalSegmentsWithCoalesce()\n");
+    if (!igc_tx_bounce_get(tx_ring, len, &slot)) {
+      pr_err("outputStart: %u byte frame does not fit TX bounce buffer, "
+             "dropping\n",
+             len);
+      netStats->outputErrors += 1;
       freePacket(skb);
       skb = NULL;
-      break;
-    }
-
-    UInt32 count = 0;
-    for (UInt32 k = 0; k < frags; k++) {
-      count +=
-          (vec[k].length + (IGC_MAX_DATA_PER_TXD - 1)) / IGC_MAX_DATA_PER_TXD;
+      continue;
     }
 
     u16 next_to_use = tx_ring->next_to_use;
     struct igc_tx_buffer *first =
         &tx_ring->tx_buffer_info[tx_ring->next_to_use];
     first->skb = skb;
-    first->bytecount = (u32)mbuf_pkthdr_len(skb);
+    first->bytecount = len;
     first->gso_segs = 1;
 
     UInt32 vlan;
@@ -6395,6 +6691,7 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
     }
     if (unlikely(tso < 0)) {
       pr_debug("tso failed, impossible\n");
+      igc_tx_bounce_unget(tx_ring, &slot);
       igc_unmap_and_free_tx_resource(tx_ring, first);
       break;
     } else if (!tso) {
@@ -6403,16 +6700,35 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
       }
       igc_tx_csum(tx_ring, first, 0, false);
     }
-    if (!igc_tx_map(tx_ring, first, hdr_len, vec, frags)) {
+
+    /* On failure also drop the context descriptor written above: the tail
+     * has not moved yet, so the hardware has not seen it. */
+    if (!igc_tx_bounce_fill(tx_ring, skb, len, &slot, vec)) {
+      netStats->outputErrors += 1;
+      pr_err("outputStart: mbuf_copydata failed, dropping\n");
+      igc_tx_bounce_unget(tx_ring, &slot);
+      tx_ring->next_to_use = next_to_use;
+      first->skb = NULL;
+      freePacket(skb);
+      skb = NULL;
+      continue;
+    }
+    first->bounce_len = slot.consumed;
+
+    if (!igc_tx_map(tx_ring, first, hdr_len, vec, 1)) {
       netStats->outputErrors += 1;
       pr_debug("output: igb_tx_map failed (%u)\n", netStats->outputErrors);
+      igc_tx_bounce_unget(tx_ring, &slot);
+      tx_ring->next_to_use = next_to_use;
+      first->bounce_len = 0;
       first->skb = NULL;
       freePacket(skb);
       skb = NULL;
       break;
     }
   }
-  if ((txNumFreeDesc = igc_desc_unused(tx_ring)) >= (MAX_SKB_FRAGS + 3)) {
+  if ((txNumFreeDesc = igc_desc_unused(tx_ring)) >= (MAX_SKB_FRAGS + 3) &&
+      igc_tx_bounce_has_room(tx_ring, maxFrame)) {
     return kIOReturnSuccess;
   } else {
     return kIOReturnNoResources;
@@ -6447,20 +6763,17 @@ UInt32 AppleIGC::outputPacket(mbuf_t skb, void *param) {
     int tso = 0;
     u32 tx_flags = 0;
     u8 hdr_len = 0;
+    u32 len = (u32)mbuf_pkthdr_len(skb);
+    struct igc_tx_bounce_slot slot;
+    struct IOPhysicalSegment vec[1];
 
-    struct IOPhysicalSegment vec[MAX_SKB_FRAGS];
-    UInt32 frags = tx_ring->netdev->txCursor()->getPhysicalSegmentsWithCoalesce(
-        skb, vec, MAX_SKB_FRAGS);
-    if (frags == 0) {
-      pr_debug("No frags by getPhysicalSegmentsWithCoalesce()\n");
+    if (len == 0 || len > tx_ring->tx_bounce_size) {
+      pr_err("output: %u byte frame does not fit TX bounce buffer, dropping\n",
+             len);
       goto error;
     }
 
-    UInt32 count = 0;
-    for (UInt32 k = 0; k < frags; k++) {
-      count +=
-          (vec[k].length + (IGC_MAX_DATA_PER_TXD - 1)) / IGC_MAX_DATA_PER_TXD;
-    }
+    UInt32 count = TXD_USE_COUNT(len);
 
     /* need: 1 descriptor per page,
      *       + 2 desc gap to keep tail from touching head,
@@ -6470,10 +6783,10 @@ UInt32 AppleIGC::outputPacket(mbuf_t skb, void *param) {
     txNumFreeDesc = igc_desc_unused(tx_ring);
 
     if (txNumFreeDesc < count + 2 + 3 // igc_maybe_stop_tx
-        || stalled) /** even if we have free desc we should exit in stalled mode
+        || stalled /** even if we have free desc we should exit in stalled mode
                        as queue is enabled by threadsafe interrupts -> native
                        igc code (see igb_poll) */
-    {
+        || !igc_tx_bounce_get(tx_ring, len, &slot)) {
       /* this is a hard error */
       netStats->outputErrors += 1;
 #ifdef DEBUG
@@ -6489,7 +6802,7 @@ UInt32 AppleIGC::outputPacket(mbuf_t skb, void *param) {
     u16 next_to_use = tx_ring->next_to_use;
     first = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
     first->skb = skb;
-    first->bytecount = (u32)mbuf_pkthdr_len(skb);
+    first->bytecount = len;
     first->gso_segs = 1;
 
     UInt32 vlan;
@@ -6507,6 +6820,7 @@ UInt32 AppleIGC::outputPacket(mbuf_t skb, void *param) {
     }
     if (unlikely(tso < 0)) {
       pr_debug("tso failed, impossible\n");
+      igc_tx_bounce_unget(tx_ring, &slot);
       igc_unmap_and_free_tx_resource(tx_ring, first);
       break;
     } else if (!tso) {
@@ -6515,9 +6829,25 @@ UInt32 AppleIGC::outputPacket(mbuf_t skb, void *param) {
       }
       igc_tx_csum(tx_ring, first, 0, false);
     }
-    if (!igc_tx_map(tx_ring, first, hdr_len, vec, frags)) {
+
+    /* On failure also drop the context descriptor written above: the tail
+     * has not moved yet, so the hardware has not seen it. */
+    if (!igc_tx_bounce_fill(tx_ring, skb, len, &slot, vec)) {
+      netStats->outputErrors += 1;
+      pr_err("output: mbuf_copydata failed, dropping\n");
+      igc_tx_bounce_unget(tx_ring, &slot);
+      tx_ring->next_to_use = next_to_use;
+      first->skb = NULL;
+      goto error;
+    }
+    first->bounce_len = slot.consumed;
+
+    if (!igc_tx_map(tx_ring, first, hdr_len, vec, 1)) {
       netStats->outputErrors += 1;
       pr_debug("output: igb_tx_map failed (%u)\n", netStats->outputErrors);
+      igc_tx_bounce_unget(tx_ring, &slot);
+      tx_ring->next_to_use = next_to_use;
+      first->bounce_len = 0;
       first->skb = NULL;
       result = kIOReturnOutputDropped;
       goto error;

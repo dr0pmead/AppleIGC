@@ -106,6 +106,20 @@ struct igc_ring {
 #ifdef __APPLE__
     AppleIGC* netdev;
     IOBufferMemoryDescriptor* pool;
+    IODMACommand* pool_cmd;         /* maps pool for this device */
+
+    /* TX only: device-mapped buffer that outgoing frames are copied into.
+     * Used as a FIFO: the output path owns tx_bounce_head and
+     * tx_bounce_alloc, completion owns tx_bounce_freed.
+     */
+    IOBufferMemoryDescriptor* tx_bounce;
+    IODMACommand* tx_bounce_cmd;
+    u8 *tx_bounce_va;
+    dma_addr_t tx_bounce_dma;
+    u32 tx_bounce_size;
+    u32 tx_bounce_head;
+    u32 tx_bounce_alloc;
+    u32 tx_bounce_freed;
 #else
     struct net_device *netdev;      /* back pointer to net_device */
     struct device *dev;             /* device for dma mapping */
@@ -497,11 +511,17 @@ struct igc_tx_buffer {
     DEFINE_DMA_UNMAP_ADDR(dma);
     DEFINE_DMA_UNMAP_LEN(len);
     u32 tx_flags;
+#ifdef __APPLE__
+    u32 bounce_len;     /* bytes of tx_bounce held until this packet completes */
+#endif
 };
 
 struct igc_rx_buffer {
     dma_addr_t dma;
     IOBufferMemoryDescriptor* page;
+#ifdef __APPLE__
+    IODMACommand* dma_cmd;  /* owns the device mapping of page; moves with it */
+#endif
     u32 page_offset;
 };
 

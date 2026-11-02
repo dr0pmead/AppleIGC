@@ -711,6 +711,7 @@ static inline unsigned int _kc_ether_crc_le(int length, unsigned char *data)
 class AppleIGC;
 #else
 typedef void IOBufferMemoryDescriptor;
+typedef void IODMACommand;
 typedef void IOPCIDevice;
 typedef void IOEthernetController;
 typedef void IOTimerEventSource;

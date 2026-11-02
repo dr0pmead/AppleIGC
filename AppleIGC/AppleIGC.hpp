@@ -119,6 +119,7 @@ public:
 private:
   IOWorkLoop *workLoop;
   IOPCIDevice *pdev;
+  IOMapper *dmaMapper;
   OSDictionary *mediumDict;
   IONetworkMedium *mediumTable[MEDIUM_INDEX_COUNT];
 #ifndef __PRIVATE_SPI__
@@ -173,6 +174,9 @@ public:
   UInt32 flags() { return iff_flags; }
   UInt32 features() { return _features; }
   igc_adapter *adapter() { return &priv_adapter; }
+  // IODMACommand takes a non-IOMapper object here as the device to map for
+  // and then uses the system mapper on that device's behalf.
+  IOMapper *mapper() { return dmaMapper ? dmaMapper : (IOMapper *)pdev; }
   IONetworkStats *getNetStats() { return netStats; }
   IOEthernetStats *getEtherStats() { return etherStats; }
   int getMulticastListCount() const { return multicastListCount; }
