@@ -6,11 +6,11 @@
 
 Intel i225/i226 2.5GbE kernel driver for macOS.
 
-[![macOS Support](https://img.shields.io/badge/macOS-12.0--26.2-blue.svg?style=for-the-badge&logo=apple)](https://developer.apple.com/macos/)
+[![macOS Support](https://img.shields.io/badge/macOS-12.0--26.7-blue.svg?style=for-the-badge&logo=apple)](https://developer.apple.com/macos/)
 [![Platform](https://img.shields.io/badge/Platform-x86__64-orange.svg?style=for-the-badge)](https://github.com/apple/darwin-xnu)
-[![Release](https://img.shields.io/badge/Release-v1.8.0--Stable-green.svg?style=for-the-badge)](https://github.com/dr0pmead/AppleIGC)
+[![Release](https://img.shields.io/badge/Release-v1.8.1--Stable-green.svg?style=for-the-badge)](https://github.com/dr0pmead/AppleIGC/releases/latest)
 
-This is a fork of the AppleIGC driver (v1.8.0) specifically optimized for stability on modern macOS releases, including the Sequoia and macOS 26 (Tahoe) developer previews. It addresses critical memory corruption issues and power state synchronization bugs present in earlier implementations.
+This is a fork of the AppleIGC driver (v1.8.1) specifically optimized for stability on modern macOS releases, including the Sequoia and macOS 26 (Tahoe) developer previews. It addresses critical memory corruption issues and power state synchronization bugs present in earlier implementations.
 
 ---
 
@@ -27,6 +27,12 @@ Older builds frequently triggered the `assertion failed: m->m_flags & M_PKTHDR` 
 Proper support for Suspend/Resume has been implemented via the `setPowerState` method.
 *   **Graceful Termination:** The driver now explicitly calls `igc_down` on sleep to stop the NIC and clear hardware registers.
 *   **Clean Re-initialization:** On wake, `igc_up` is used to hardware-reset the controller and re-allocate ring buffers. This prevents desynchronization that previously led to hangs after sleep.
+
+### VT-d / AppleVTD (v1.8.1)
+On macOS 26 Tahoe with AppleVTD active, older builds brought the link up but passed no traffic. The driver handed the NIC addresses that were never mapped for its IOMMU domain.
+*   **Explicit DMA mapping:** Descriptor rings and RX pages are mapped with `IODMACommand` through the device's IOMapper, so the NIC only sees addresses valid for it.
+*   **TX bounce buffer:** Outgoing frames are copied into a pre-mapped buffer instead of mapping each mbuf.
+*   **Leak fixes:** RX pages leaked on the first link-up, and TX buffer info was freed with the wrong size.
 
 ### Driver Optimizations
 *   **EEE (Energy Efficient Ethernet):** Disabled to prevent link-state bouncing and latency spikes common on i225/i226 controllers.
@@ -49,7 +55,7 @@ This driver has been extensively tested on the following setup:
 
 ## Installation
 
-1. Download the latest `AppleIGC.kext` (v1.8.0) from the [Releases](https://github.com/dr0pmead/AppleIGC/releases) section.
+1. Download the latest `AppleIGC.kext` (v1.8.1) from the [Releases](https://github.com/dr0pmead/AppleIGC/releases) section.
 2. Add the corresponding entry to your `config.plist`.
 3. Add `e1000=0` to your boot-args to ensure the system uses this driver instead of the native one.
 
