@@ -143,6 +143,17 @@ private:
   bool enabledForNetif;
   bool bSuspended;
   bool useTSO;
+  bool usingMsi;
+  bool pcieLost;
+  bool irqStalled;
+  bool irqCheckArmed;
+  bool linkCheckPending;
+  UInt8 linkDownReads;
+
+  UInt32 irqCount;
+  UInt32 lastIrqCount;
+  UInt64 lastHealthCheck;
+  UInt64 linkHoldoff;
 
   bool linkUp;
 #ifdef __PRIVATE_SPI__
@@ -194,9 +205,19 @@ public:
   void setCarrier(bool);
 
   void setTimers(bool enable);
+  void requestReset();
 
 private:
   void interruptOccurred(IOInterruptEventSource *src, int count);
+  void enableLinkInterrupts();
+  void logHwState(const char *why);
+  void resetAdapter();
+  void suspendAdapter();
+  void resumeAdapter();
+  static IOReturn powerStateAction(OSObject *owner, void *wake, void *arg1,
+                                   void *arg2, void *arg3);
+  static IOReturn shutdownAction(OSObject *owner, void *arg0, void *arg1,
+                                 void *arg2, void *arg3);
 
   void watchdogTask();
   // void updatePhyInfoTask();

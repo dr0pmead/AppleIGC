@@ -200,6 +200,9 @@ static mbuf_t netdev_alloc_skb_ip_align(IOEthernetController *netdev,
     return NULL;
   }
   mbuf_pkthdr_setlen(skb, 0);
+  /* mbuf_copyback() only grows m_len, so a stale length here would leave
+   * m_len longer than the packet for every short frame. */
+  mbuf_setlen(skb, 0);
   return skb;
 }
 
@@ -400,6 +403,13 @@ static void igc_get_hw_control(struct igc_adapter *adapter) {
 #define IGC_TX_BOUNCE_MIN_SIZE (64 * 1024)
 #define IGC_TX_BOUNCE_ALIGN 64
 #define IGC_TX_BOUNCE_MAX_FRAME (65536 + ETH_HLEN + VLAN_HLEN)
+
+#define IGC_WATCHDOG_UP_MS 1000
+#define IGC_WATCHDOG_DOWN_MS 500
+#define IGC_WATCHDOG_POLL_MS 1 /* while interrupts are not being delivered */
+#define IGC_POLL_DRAIN_MAX 8   /* polls per watchdog tick in that state */
+#define IGC_HEALTH_PERIOD 90   /* jiffies here are 10 ms */
+#define IGC_LINK_HOLDOFF 100   /* jiffies to ignore link-up after a reset */
 
 /*
  * Every address handed to the NIC must come from the device's own IOMapper.
@@ -2611,8 +2621,10 @@ static struct sk_buff *igc_fetch_rx_buffer(struct igc_ring *rx_ring,
     prefetch(page_addr + L1_CACHE_BYTES);
 #endif
 
-    /* allocate a skb to store the frags */
-    skb = netdev_alloc_skb_ip_align(rx_ring->netdev, IGC_RX_HDR_LEN);
+    /* allocate a skb to store the frags; one 2 KB cluster holds a standard
+     * frame, so mbuf_copyback() does not have to build a chain. allocatePacket
+     * adds 1 byte for the 2-byte start alignment. */
+    skb = netdev_alloc_skb_ip_align(rx_ring->netdev, IGC_RXBUFFER_2048 - 1);
     if (unlikely(!skb)) {
       rx_ring->rx_stats.alloc_failed++;
       return NULL;
@@ -2876,7 +2888,12 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget) {
     if (tx_buffer->next_to_watch &&
         time_after(jiffies,
                    tx_buffer->time_stamp + (adapter->tx_timeout_factor * HZ)) &&
-        !(rd32(IGC_STATUS) & IGC_STATUS_TXOFF)) {
+        !(rd32(IGC_STATUS) & IGC_STATUS_TXOFF) &&
+        /* head == tail is normally a write-back still on its way, but a lost
+         * write-back looks the same, so that excuse has a time limit */
+        (rd32(IGC_TDH(tx_ring->reg_idx)) != readl(tx_ring->tail) ||
+         time_after(jiffies, tx_buffer->time_stamp +
+                                 (4 * adapter->tx_timeout_factor * HZ)))) {
       /* detected Tx unit hang */
       netdev_err(tx_ring->netdev,
                  "Detected Tx Unit Hang\n"
@@ -2896,7 +2913,8 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget) {
                  tx_buffer->next_to_watch, jiffies,
                  tx_buffer->next_to_watch->wb.status);
 #ifdef __APPLE__
-      netif_stop_queue(tx_ring->netdev);
+      /* Stopping the queue alone would leave TX off until the next link flap */
+      tx_ring->netdev->requestReset();
 #else
       netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
 #endif
@@ -4173,6 +4191,16 @@ static int igc_poll(struct igc_q_vector *q_vector, int budget) {
    */
   // if (likely(napi_complete_done(napi, work_done)))
   igc_ring_irq_enable(q_vector);
+
+#ifdef __APPLE__
+  /* There is no NAPI to poll again: when the budget ran out, raise an
+   * interrupt for the remaining work. */
+  if (!clean_complete && !test_bit(__IGC_DOWN, &q_vector->adapter->state)) {
+    struct igc_hw *hw = &q_vector->adapter->hw;
+
+    wr32(IGC_ICS, IGC_ICS_RXDMT0);
+  }
+#endif
 
   return min(work_done, budget - 1);
 }
@@ -5534,6 +5562,11 @@ u32 igc_rd32(struct igc_hw *hw, u32 reg) {
   return value;
 }
 
+/* Like igc_rd32(), but stays quiet when the device has dropped off the bus. */
+static inline u32 igc_peek(struct igc_hw *hw, u32 reg) {
+  return readl(&hw->hw_addr[reg]);
+}
+
 #ifndef __APPLE__
 static int __igc_shutdown(struct pci_dev *pdev, bool *enable_wake,
                           bool runtime) {
@@ -5882,6 +5915,16 @@ bool AppleIGC::init(OSDictionary *properties) {
   bSuspended = FALSE;
 
   linkUp = FALSE;
+  usingMsi = FALSE;
+  pcieLost = FALSE;
+  irqStalled = FALSE;
+  irqCheckArmed = FALSE;
+  linkCheckPending = FALSE;
+  linkDownReads = 0;
+  irqCount = 0;
+  lastIrqCount = 0;
+  lastHealthCheck = 0;
+  linkHoldoff = 0;
 
   eeeMode = 0;
 
@@ -6169,6 +6212,15 @@ bool AppleIGC::start(IOService *provider) {
          dmaMapper ? dmaMapper->getName() : "none (system mapper for pdev)",
          dmaMapper, IOMapper::gSystem);
 
+  {
+    UInt8 pcieCap = 0;
+
+    if (pdev->findPCICapability(kIOPCIPCIExpressCapability, &pcieCap))
+      pr_err("PCIe link control 0x%04x (ASPM bits %u)\n",
+             pdev->configRead16(pcieCap + 0x10),
+             pdev->configRead16(pcieCap + 0x10) & 3);
+  }
+
 #ifdef NETIF_F_TSO
   useTSO = FALSE; // getBoolOption("NETIF_F_TSO", TRUE);
 #else
@@ -6252,15 +6304,21 @@ IOReturn AppleIGC::enable(IONetworkInterface *netif) {
     }
 #endif
 
-    if (!carrier()) {
-      setCarrier(intelCheckLink(&priv_adapter)); // setValidLinkStatus(Active)
-    }
 #ifndef __PRIVATE_SPI__
     stalled = FALSE;
 #endif
     eeeMode = 0;
     hw->mac.get_link_status = true;
+    linkUp = false;
+    pcieLost = false;
+    irqStalled = false;
+    irqCheckArmed = false;
+    linkCheckPending = false;
+    linkDownReads = 0;
+    linkHoldoff = 0;
     enabledForNetif = true;
+    /* The watchdog brings the link up; it does nothing before this point. */
+    watchdogSource->setTimeoutMS(1);
   } else {
     pr_err("enable() on not disabled interface\n");
   }
@@ -6279,8 +6337,10 @@ IOReturn AppleIGC::disable(IONetworkInterface *netif) {
     RELEASE(txMbufCursor);
 #endif
     watchdogSource->cancelTimeout();
+    resetSource->cancelTimeout();
     interruptSource->disable();
     setTimers(false);
+    linkUp = false;
 
     igc_close(this);
 
@@ -6577,10 +6637,30 @@ void AppleIGC::setLinkUp() {
   interruptSource->enable();
   setTimers(true);
 
+  pr_err("link up on en%u: %u Mbps, %s duplex\n", netif->getUnitNumber(),
+         (unsigned)adapter->link_speed,
+         adapter->link_duplex == FULL_DUPLEX ? "full" : "half");
   pr_debug("[LU]: Link Up on en%u (%s), %s, %s, %s%s (igc driver ver %08x)\n",
            netif->getUnitNumber(), deviceModelNames[chip_idx].name, speedName,
            duplexName, flowName, eeeName, 0);
   pr_debug("setLinkUp() <===\n");
+}
+
+IOReturn AppleIGC::shutdownAction(OSObject *owner, void *arg0, void *arg1,
+                                  void *arg2, void *arg3) {
+  AppleIGC *me = (AppleIGC *)owner;
+
+  me->disable(me->netif);
+
+  /* Restore the original MAC address. */
+  me->priv_adapter.hw.mac.ops.rar_set(&me->priv_adapter.hw,
+                                      me->priv_adapter.hw.mac.perm_addr, 0);
+
+  /*
+   * Let the firmware know that the network interface is now closed
+   */
+  igc_release_hw_control(&me->priv_adapter);
+  return kIOReturnSuccess;
 }
 
 void AppleIGC::systemWillShutdown(IOOptionBits specifier) {
@@ -6588,16 +6668,11 @@ void AppleIGC::systemWillShutdown(IOOptionBits specifier) {
 
   if ((kIOMessageSystemWillPowerOff | kIOMessageSystemWillRestart) &
       specifier) {
-    disable(netif);
-
-    /* Restore the original MAC address. */
-    priv_adapter.hw.mac.ops.rar_set(&priv_adapter.hw,
-                                    priv_adapter.hw.mac.perm_addr, 0);
-
-    /*
-     * Let the firmware know that the network interface is now closed
-     */
-    igc_release_hw_control(&priv_adapter);
+    /* disable() frees the rings: keep interrupts and timers out meanwhile. */
+    if (workLoop)
+      workLoop->runAction(&AppleIGC::shutdownAction, this);
+    else
+      shutdownAction(this, NULL, NULL, NULL, NULL);
   }
 
   pr_debug("systemWillShutdown() <===\n");
@@ -6606,14 +6681,25 @@ void AppleIGC::systemWillShutdown(IOOptionBits specifier) {
   super::systemWillShutdown(specifier);
 }
 
-/** This method doesn't completely shutdown NIC. It intentionally keeps
- * eventSources and enables interruptes back
+/* Only link and reset events: the rings are empty while the link is down. */
+void AppleIGC::enableLinkInterrupts() {
+  struct igc_hw *hw = &priv_adapter.hw;
+  const u32 mask = IGC_IMS_LSC | IGC_IMS_RXSEQ | IGC_IMS_DRSTA;
+
+  wr32(IGC_IMS, mask);
+  wr32(IGC_IAM, mask);
+}
+
+/** This method doesn't completely shutdown NIC. It keeps the event sources
+ * and link interrupts so that the link can come back. __IGC_DOWN stays set
+ * until setLinkUp(), which keeps igc_poll() away from the empty rings.
  */
 void AppleIGC::setLinkDown() {
   struct igc_hw *hw = &priv_adapter.hw;
   struct igc_adapter *adapter = &priv_adapter;
 
   pr_debug("setLinkDown() ===>\n");
+  pr_err("link down on en%u\n", netif->getUnitNumber());
 
   netif->stopOutputThread();
   netif->flushOutputQueue();
@@ -6622,13 +6708,20 @@ void AppleIGC::setLinkDown() {
   /** igb_down also performs setLinkStatus(Valid) via netif_carrier_off */
   igc_down(adapter);
 
-  clear_bit(__IGC_DOWN, &adapter->state);
+  /* igc_down() stopped the timers, but the watchdog has to keep checking the
+   * link. A stale reset request would only restart autonegotiation. */
+  resetSource->cancelTimeout();
+  setTimers(true);
 
   /* Clear any pending interrupts. */
   igc_rd32(hw, IGC_ICR);
-  igc_irq_enable(adapter);
+  enableLinkInterrupts();
 
-  pr_debug("Link down on en%u\n", netif->getUnitNumber());
+  irqStalled = false;
+  irqCheckArmed = false;
+  linkHoldoff = jiffies + IGC_LINK_HOLDOFF;
+  watchdogSource->setTimeoutMS(IGC_WATCHDOG_DOWN_MS);
+
   pr_debug("setLinkDown() <===\n");
 }
 
@@ -6636,6 +6729,10 @@ void AppleIGC::setLinkDown() {
 IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
                                IOOptionBits options) {
   struct igc_adapter *adapter = &priv_adapter;
+
+  if (!enabledForNetif || !linkUp || test_bit(__IGC_DOWN, &adapter->state))
+    return kIOReturnNotReady;
+
   struct igc_ring *tx_ring = igc_tx_queue_mapping(adapter, skb);
   mbuf_t skb = NULL;
   /* checked before dequeueing: a dequeued frame cannot be handed back */
@@ -7209,20 +7306,11 @@ bool AppleIGC::intelCheckLink(struct igc_adapter *adapter) {
   hw->mac.ops.check_for_link(hw);
   link_active = !hw->mac.get_link_status;
 
-  if (hw->mac.type == igc_i225) {
-    if (!netif_carrier_ok(adapter->netdev)) {
-      adapter->flags &= ~IGC_FLAG_NEED_LINK_UPDATE;
-    } else if (!(adapter->flags & IGC_FLAG_NEED_LINK_UPDATE)) {
-      adapter->flags |= IGC_FLAG_NEED_LINK_UPDATE;
-      adapter->link_check_timeout = jiffies;
-    }
-  }
-
   return link_active;
 }
 
 /**
-  this is called by interrupt
+  Runs from the watchdog, never directly from the interrupt handler.
     @see igc_watchdog_task
  */
 void AppleIGC::checkLinkStatus() {
@@ -7239,36 +7327,26 @@ void AppleIGC::checkLinkStatus() {
   pr_debug("checkLinkStatus() ===> link=%u, carrier=%u, linkUp=%u\n", link,
            carrier(), linkUp);
 
-  if (adapter->flags & IGC_FLAG_NEED_LINK_UPDATE) {
-    if (time_after(jiffies, (adapter->link_check_timeout + HZ)))
-      adapter->flags &= ~IGC_FLAG_NEED_LINK_UPDATE;
-    else {
-      pr_debug("Force link down due to IGC_FLAG_NEED_LINK_UPDATE\n");
-      link = FALSE;
-    }
-  }
-
-  if (linkUp) {
-    if (link) {
-      /* The link partner must have changed some setting. Initiate renegotiation
-       * of the link parameters to make sure that the MAC is programmed
-       * correctly.
-       */
-      watchdogSource->cancelTimeout();
-      igc_update_stats(&priv_adapter);
-      intelRestart();
-    } else {
-      /* Stop watchdog and statistics updates. */
-      watchdogSource->cancelTimeout();
-      setLinkDown();
-    }
-  } else {
-    if (link) {
+  if (link) {
+    linkDownReads = 0;
+    if (!linkUp) {
+      /* A reset restarts autonegotiation, so the PHY can still report the old
+       * link for a moment. Going up now would only bounce straight back. */
+      if (jiffies < linkHoldoff) {
+        hw->mac.get_link_status = true;
+        return;
+      }
       /* Start rx/tx and inform upper layers that the link is up now. */
       setLinkUp();
-      /* Perform live checks periodically. */
-      watchdogSource->setTimeoutMS(200);
     }
+    /* A link event on a stable link needs no restart. */
+  } else if (linkUp) {
+    /* A failed PHY read also looks like "no link". While the MAC still sees
+     * the link, wait for a second reading before resetting anything. */
+    if ((igc_peek(hw, IGC_STATUS) & IGC_STATUS_LU) && ++linkDownReads < 2)
+      return;
+    linkDownReads = 0;
+    setLinkDown();
   }
   pr_debug("checkLinkStatus() <===\n");
 }
@@ -7278,24 +7356,33 @@ void AppleIGC::interruptOccurred(IOInterruptEventSource *src, int count) {
   struct igc_adapter *adapter = &priv_adapter;
   struct igc_q_vector *q_vector = adapter->q_vector[0];
   struct igc_hw *hw = &adapter->hw;
+  u32 icr;
+
+  if (bSuspended)
+    return;
 
   /* Interrupt Auto-Mask...upon reading ICR, interrupts are masked.  No
    * need for the IMC write */
-  u32 icr = igc_rd32(hw, IGC_ICR);
+  icr = igc_peek(hw, IGC_ICR);
+
+  /* The device is gone; the watchdog reports it. */
+  if (unlikely(icr == 0xFFFFFFFF))
+    return;
 
   if (!enabledForNetif) {
     pr_err("Interrupt 0x%08x on disabled device\n", icr);
     return;
   }
 
-  /* IMS will not auto-mask if INT_ASSERTED is not set, and if it is
-   * not set, then the adapter didn't send an interrupt */
-  if (!(icr & IGC_ICR_INT_ASSERTED)) {
+  /* INT_ASSERTED identifies our interrupts on a shared legacy line. MSI
+   * delivery already identifies the source. */
+  if (!usingMsi && !(icr & IGC_ICR_INT_ASSERTED)) {
     return;
   }
+  irqCount++;
   igc_write_itr(q_vector);
   if (icr & IGC_ICR_DRSTA) {
-    resetSource->setTimeoutMS(1);
+    requestReset();
   }
 
   if (icr & IGC_ICR_DOUTSYNC) {
@@ -7303,16 +7390,20 @@ void AppleIGC::interruptOccurred(IOInterruptEventSource *src, int count) {
     adapter->stats.doosync++;
   }
   if (unlikely(icr & (IGC_ICR_RXSEQ | IGC_ICR_LSC))) {
-    checkLinkStatus();
-    //
-    //        /* guard against interrupt when we're going down */
-    //        if (!test_bit(__IGB_DOWN, &adapter->state))
-    //            watchdogSource->setTimeoutMS(1);
-  } else {
-    igc_poll(q_vector, 64);
+    /* Link work takes the adapter down and up, so leave it to the watchdog.
+     * Re-arming on every event could keep pushing its deadline back. */
+    hw->mac.get_link_status = true;
+    if (!linkCheckPending) {
+      linkCheckPending = true;
+      watchdogSource->setTimeoutMS(1);
+    }
   }
 
-  wr32(IGC_EIMS, adapter->eims_other);
+  /* Reading ICR masked the interrupts: every path must unmask them. */
+  if (!test_bit(__IGC_DOWN, &adapter->state))
+    igc_poll(q_vector, 64);
+  else
+    enableLinkInterrupts();
 }
 
 void AppleIGC::interruptHandler(OSObject *target, IOInterruptEventSource *src,
@@ -7325,7 +7416,67 @@ void AppleIGC::interruptHandler(OSObject *target, IOInterruptEventSource *src,
 void AppleIGC::watchdogTask() {
   struct igc_adapter *adapter = &priv_adapter;
   struct igc_hw *hw = &adapter->hw;
+  u32 status;
+  u64 now;
   int i;
+
+  if (!enabledForNetif || bSuspended)
+    return;
+
+  status = igc_peek(hw, IGC_STATUS);
+  if (status == 0xFFFFFFFF) {
+    if (!pcieLost) {
+      pcieLost = true;
+      pr_err("PCIe device stopped responding (vendor id 0x%04x)\n",
+             pdev->configRead16(kIOPCIConfigVendorID));
+    }
+    return;
+  }
+  if (pcieLost) {
+    pcieLost = false;
+    pr_err("PCIe device is responding again\n");
+    resetAdapter();
+    return;
+  }
+
+  /* The interrupt only asks for this check, and the poll catches a link
+   * change whose interrupt never arrived. */
+  if (hw->mac.get_link_status || !!(status & IGC_STATUS_LU) != linkUp)
+    checkLinkStatus();
+
+  if (test_bit(__IGC_DOWN, &adapter->state))
+    return;
+
+  /* Polling is the only way to see packets now, so empty the rings. igc_poll()
+   * returns budget - 1 when it used the whole budget. */
+  if (irqStalled) {
+    for (i = 0; i < IGC_POLL_DRAIN_MAX; i++) {
+      if (igc_poll(adapter->q_vector[0], 64) != 63)
+        break;
+    }
+  }
+
+  /* Link events can run this early; the checks below need a full period. */
+  now = jiffies;
+  if (now - lastHealthCheck < IGC_HEALTH_PERIOD)
+    return;
+  lastHealthCheck = now;
+
+  /* The ICS write below raises an interrupt every period, so a period
+   * without one means delivery has stopped. */
+  if (irqCheckArmed) {
+    if (irqCount == lastIrqCount) {
+      if (!irqStalled) {
+        irqStalled = true;
+        logHwState("no interrupts for a full period, polling (if this "
+                   "repeats, try IGC_FORCE_INTX in Info.plist)");
+        igc_irq_enable(adapter);
+      }
+    } else if (irqStalled) {
+      irqStalled = false;
+      pr_err("interrupts resumed\n");
+    }
+  }
 
   igc_update_stats(adapter);
 
@@ -7335,6 +7486,9 @@ void AppleIGC::watchdogTask() {
     /* Force detection of hung controller every watchdog period */
     set_bit(IGC_RING_FLAG_TX_DETECT_HANG, &tx_ring->flags);
   }
+
+  lastIrqCount = irqCount;
+  irqCheckArmed = true;
 
   /* Cause software interrupt to ensure rx ring is cleaned */
   /*if (adapter->msix_entries) {
@@ -7346,30 +7500,69 @@ void AppleIGC::watchdogTask() {
   } else {*/
   wr32(IGC_ICS, IGC_ICS_RXDMT0);
   //}
-
-  /* Reset the timer */
-  if (!test_bit(__IGC_DOWN, &adapter->state)) {
-    if (adapter->flags & IGC_FLAG_NEED_LINK_UPDATE) {
-      pr_debug("watchdogTask(): adapter has IGB_FLAG_NEED_LINK_UPDATE, forcing "
-               "restart.\n");
-      intelRestart();
-    }
-  }
-
-  watchdogSource->setTimeoutMS(200);
 }
 
 void AppleIGC::watchdogHandler(OSObject *target, IOTimerEventSource *src) {
   AppleIGC *me = (AppleIGC *)target;
+  me->linkCheckPending = false;
   me->watchdogTask();
-  me->watchdogSource->setTimeoutMS(1000);
+  if (me->enabledForNetif && !me->bSuspended)
+    me->watchdogSource->setTimeoutMS(me->irqStalled ? IGC_WATCHDOG_POLL_MS
+                                     : me->linkUp   ? IGC_WATCHDOG_UP_MS
+                                                    : IGC_WATCHDOG_DOWN_MS);
+}
+
+void AppleIGC::logHwState(const char *why) {
+  struct igc_adapter *adapter = &priv_adapter;
+  struct igc_hw *hw = &adapter->hw;
+  struct igc_ring *tx = adapter->tx_ring[0];
+  struct igc_ring *rx = adapter->rx_ring[0];
+
+  pr_err("%s: STATUS 0x%08x IMS 0x%08x irqs %u\n", why,
+         igc_peek(hw, IGC_STATUS), igc_peek(hw, IGC_IMS), irqCount);
+  pr_err("  TX head %u tail %u, sw clean %u use %u; RX head %u tail %u, sw "
+         "clean %u use %u\n",
+         igc_peek(hw, IGC_TDH(tx->reg_idx)), igc_peek(hw, IGC_TDT(tx->reg_idx)),
+         tx->next_to_clean, tx->next_to_use, igc_peek(hw, IGC_RDH(rx->reg_idx)),
+         igc_peek(hw, IGC_RDT(rx->reg_idx)), rx->next_to_clean,
+         rx->next_to_use);
+}
+
+void AppleIGC::requestReset() {
+  if (resetSource)
+    resetSource->setTimeoutMS(1);
+}
+
+void AppleIGC::resetAdapter() {
+  struct igc_adapter *adapter = &priv_adapter;
+  struct igc_hw *hw = &adapter->hw;
+
+  if (!enabledForNetif || bSuspended)
+    return;
+
+  logHwState("resetting adapter");
+
+  /* Going through link down restores carrier, output and timers on the way
+   * back up, which a bare igc_down()/igc_up() pair does not. */
+  if (!test_bit(__IGC_DOWN, &adapter->state)) {
+    setLinkDown();
+  } else {
+    igc_reset(adapter);
+    igc_rd32(hw, IGC_ICR);
+    enableLinkInterrupts();
+    linkHoldoff = jiffies + IGC_LINK_HOLDOFF;
+    watchdogSource->setTimeoutMS(IGC_WATCHDOG_DOWN_MS);
+  }
+  hw->mac.get_link_status = true;
 }
 
 void AppleIGC::resetHandler(OSObject *target, IOTimerEventSource *src) {
   AppleIGC *me = (AppleIGC *)target;
+  /* A fired timer keeps its deadline and would fire again on enable(). */
+  src->cancelTimeout();
   if (src == me->resetSource) {
     pr_debug("resetHandler: resetSource\n");
-    igc_reinit_locked(&me->priv_adapter);
+    me->resetAdapter();
   } else if (src == me->dmaErrSource) {
     pr_debug("resetHandler: dmaErrSource\n");
     // igc_dma_err_task(&me->priv_adapter,src);
@@ -7392,23 +7585,68 @@ IOReturn AppleIGC::setPowerState(unsigned long powerStateOrdinal,
     return IOPMAckImplied;
   powerState = powerStateOrdinal;
 
-  if (powerStateOrdinal == 0) { // SUSPEND/SHUTDOWN
-    pr_err("suspend start: stopping interface\n");
-    if (netif->getInterfaceState() & kIONetworkInterfaceOpenedState) {
-      igc_down(&priv_adapter);
-    }
-    pr_err("suspend end.\n");
-    bSuspended = TRUE;
-  } else if (bSuspended) { // WAKE
-    pr_err("resume start: restarting interface\n");
-    if (netif->getInterfaceState() & kIONetworkInterfaceOpenedState) {
-      igc_up(&priv_adapter);
-    }
-    pr_err("resume end.\n");
-    bSuspended = FALSE;
+  /* Power changes arrive on their own thread: serialize with the work loop. */
+  if (powerStateOrdinal == 0 || bSuspended) {
+    void *wake = (void *)(uintptr_t)(powerStateOrdinal != 0);
+
+    pr_err("%s start\n", wake ? "resume" : "suspend");
+    if (workLoop)
+      workLoop->runAction(&AppleIGC::powerStateAction, this, wake);
+    else
+      powerStateAction(this, wake, NULL, NULL, NULL);
+    pr_err("%s end\n", wake ? "resume" : "suspend");
   }
   /* acknowledge the completion of our power state change */
   return IOPMAckImplied;
+}
+
+IOReturn AppleIGC::powerStateAction(OSObject *owner, void *wake, void *arg1,
+                                    void *arg2, void *arg3) {
+  AppleIGC *me = (AppleIGC *)owner;
+
+  if (wake)
+    me->resumeAdapter();
+  else
+    me->suspendAdapter();
+  return kIOReturnSuccess;
+}
+
+void AppleIGC::suspendAdapter() {
+  bSuspended = TRUE;
+
+  /* The rings only exist while the interface is enabled. */
+  if (!enabledForNetif)
+    return;
+
+  netif->stopOutputThread();
+  netif->flushOutputQueue();
+  linkUp = false;
+  watchdogSource->cancelTimeout();
+  resetSource->cancelTimeout();
+  igc_down(&priv_adapter);
+  igc_irq_disable(&priv_adapter);
+}
+
+/* Leaves the adapter down: the watchdog brings it up when the link returns. */
+void AppleIGC::resumeAdapter() {
+  struct igc_adapter *adapter = &priv_adapter;
+  struct igc_hw *hw = &adapter->hw;
+
+  bSuspended = FALSE;
+
+  if (!enabledForNetif)
+    return;
+
+  igc_reset(adapter);
+  pcieLost = false;
+  irqStalled = false;
+  irqCheckArmed = false;
+  linkHoldoff = jiffies + IGC_LINK_HOLDOFF;
+  setTimers(true);
+  igc_rd32(hw, IGC_ICR);
+  enableLinkInterrupts();
+  hw->mac.get_link_status = true;
+  watchdogSource->setTimeoutMS(IGC_WATCHDOG_DOWN_MS);
 }
 
 IOReturn AppleIGC::getMaxPacketSize(UInt32 *maxSize) const {
@@ -7429,7 +7667,22 @@ IOReturn AppleIGC::setMaxPacketSize(UInt32 maxSize) {
   UInt32 newMtu = maxSize - (ETH_HLEN + ETH_FCS_LEN);
   if (newMtu != _mtu) {
     _mtu = newMtu;
-    igc_change_mtu(this, _mtu);
+    if (enabledForNetif || bSuspended) {
+      u32 maxFrame = newMtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
+
+      if (maxFrame < ETH_FRAME_LEN + ETH_FCS_LEN)
+        maxFrame = ETH_FRAME_LEN + ETH_FCS_LEN;
+      priv_adapter.max_frame_size = maxFrame;
+
+      /* igc_up() programs the new size. Bouncing the link gets there and also
+       * restores carrier and output; after sleep, resume does it. */
+      if (!bSuspended) {
+        setLinkDown();
+        priv_adapter.hw.mac.get_link_status = true;
+      }
+    } else {
+      igc_change_mtu(this, _mtu);
+    }
   }
   return kIOReturnSuccess;
 }
@@ -7655,6 +7908,8 @@ error1:
 
 bool AppleIGC::initEventSources(IOService *provider) {
   bool result = false;
+  int interruptIndex = 0;
+  int interruptType = 0;
 
   pr_debug("initEventSources() ===>\n");
 
@@ -7679,12 +7934,36 @@ bool AppleIGC::initEventSources(IOService *provider) {
   }
   transmitQueue->retain();
 #endif
+  /* Source 0 is usually the legacy INTx line, which can miss interrupts under
+   * sustained traffic. IGC_FORCE_INTX in Info.plist keeps it for testing. */
+  usingMsi = false;
+  if (!getBoolOption("IGC_FORCE_INTX", false)) {
+    for (int index = 0;
+         provider->getInterruptType(index, &interruptType) == kIOReturnSuccess;
+         index++) {
+      if (interruptType & kIOInterruptTypePCIMessaged) {
+        interruptIndex = index;
+        usingMsi = true;
+        break;
+      }
+    }
+  }
+
   interruptSource = IOInterruptEventSource::interruptEventSource(
-      this, &AppleIGC::interruptHandler, provider);
+      this, &AppleIGC::interruptHandler, provider, interruptIndex);
+  if (!interruptSource && usingMsi) {
+    pr_err("MSI source %d failed, falling back to source 0\n", interruptIndex);
+    interruptIndex = 0;
+    usingMsi = false;
+    interruptSource = IOInterruptEventSource::interruptEventSource(
+        this, &AppleIGC::interruptHandler, provider, interruptIndex);
+  }
   if (!interruptSource) {
-    pr_err("MSI interrupt could not be enabled.\n");
+    pr_err("Interrupt source could not be enabled.\n");
     goto error1;
   }
+  pr_err("interrupt source %d (%s)\n", interruptIndex,
+         usingMsi ? "MSI" : "legacy");
   myWorkLoop->addEventSource(interruptSource);
 
   watchdogSource =
