@@ -154,6 +154,34 @@ private:
   UInt32 lastIrqCount;
   UInt64 lastHealthCheck;
   UInt64 linkHoldoff;
+  UInt8 pcieCapOffset;
+
+  /* Published to the IORegistry: IOLog from an injected kext may not be
+   * readable. The output* and blocked* counters belong to the output thread,
+   * everything else to the work loop. */
+  struct Diagnostics {
+    UInt32 heartbeat;
+    UInt32 irqStalls;
+    UInt32 pollDrains;
+    UInt32 lscEvents;
+    UInt32 rxseqEvents;
+    UInt32 drstaEvents;
+    UInt32 doutsyncEvents;
+    UInt32 txHangs;
+    UInt32 resets;
+    UInt32 linkUps;
+    UInt32 linkDowns;
+    UInt32 pcieLosses;
+    UInt32 txWakes;
+    UInt32 outputCalls;
+    UInt32 outputFrames;
+    UInt32 outputNotReady;
+    UInt32 blockedOnDesc;
+    UInt32 blockedOnBounce;
+    UInt64 lastPublish;
+    char firstProblem[360];
+    char lastProblem[360];
+  } diag;
 
   bool linkUp;
 #ifdef __PRIVATE_SPI__
@@ -206,11 +234,14 @@ public:
 
   void setTimers(bool enable);
   void requestReset();
+  void reportTxHang();
 
 private:
   void interruptOccurred(IOInterruptEventSource *src, int count);
   void enableLinkInterrupts();
+  void hwStateText(char *buf, size_t size);
   void logHwState(const char *why);
+  void publishDiagnostics();
   void resetAdapter();
   void suspendAdapter();
   void resumeAdapter();

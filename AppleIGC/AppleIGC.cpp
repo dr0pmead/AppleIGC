@@ -410,6 +410,8 @@ static void igc_get_hw_control(struct igc_adapter *adapter) {
 #define IGC_POLL_DRAIN_MAX 8   /* polls per watchdog tick in that state */
 #define IGC_HEALTH_PERIOD 90   /* jiffies here are 10 ms */
 #define IGC_LINK_HOLDOFF 100   /* jiffies to ignore link-up after a reset */
+#define IGC_DIAG_PERIOD IGC_HEALTH_PERIOD
+#define IGC_DIAG_STATE_LEN 240
 
 /*
  * Every address handed to the NIC must come from the device's own IOMapper.
@@ -2914,7 +2916,7 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget) {
                  tx_buffer->next_to_watch->wb.status);
 #ifdef __APPLE__
       /* Stopping the queue alone would leave TX off until the next link flap */
-      tx_ring->netdev->requestReset();
+      tx_ring->netdev->reportTxHang();
 #else
       netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
 #endif
@@ -5925,6 +5927,8 @@ bool AppleIGC::init(OSDictionary *properties) {
   lastIrqCount = 0;
   lastHealthCheck = 0;
   linkHoldoff = 0;
+  pcieCapOffset = 0;
+  bzero(&diag, sizeof(diag));
 
   eeeMode = 0;
 
@@ -6212,14 +6216,12 @@ bool AppleIGC::start(IOService *provider) {
          dmaMapper ? dmaMapper->getName() : "none (system mapper for pdev)",
          dmaMapper, IOMapper::gSystem);
 
-  {
-    UInt8 pcieCap = 0;
-
-    if (pdev->findPCICapability(kIOPCIPCIExpressCapability, &pcieCap))
-      pr_err("PCIe link control 0x%04x (ASPM bits %u)\n",
-             pdev->configRead16(pcieCap + 0x10),
-             pdev->configRead16(pcieCap + 0x10) & 3);
-  }
+  if (pdev->findPCICapability(kIOPCIPCIExpressCapability, &pcieCapOffset))
+    pr_err("PCIe link control 0x%04x (ASPM bits %u)\n",
+           pdev->configRead16(pcieCapOffset + 0x10),
+           pdev->configRead16(pcieCapOffset + 0x10) & 3);
+  else
+    pcieCapOffset = 0;
 
 #ifdef NETIF_F_TSO
   useTSO = FALSE; // getBoolOption("NETIF_F_TSO", TRUE);
@@ -6355,6 +6357,8 @@ IOReturn AppleIGC::disable(IONetworkInterface *netif) {
       setCarrier(false);
       pr_debug("Link down on en%u\n", netif->getUnitNumber());
     }
+
+    publishDiagnostics();
 
     if (pdev && pdev->isOpen())
       pdev->close(this);
@@ -6637,6 +6641,7 @@ void AppleIGC::setLinkUp() {
   interruptSource->enable();
   setTimers(true);
 
+  diag.linkUps++;
   pr_err("link up on en%u: %u Mbps, %s duplex\n", netif->getUnitNumber(),
          (unsigned)adapter->link_speed,
          adapter->link_duplex == FULL_DUPLEX ? "full" : "half");
@@ -6699,6 +6704,7 @@ void AppleIGC::setLinkDown() {
   struct igc_adapter *adapter = &priv_adapter;
 
   pr_debug("setLinkDown() ===>\n");
+  diag.linkDowns++;
   pr_err("link down on en%u\n", netif->getUnitNumber());
 
   netif->stopOutputThread();
@@ -6730,8 +6736,11 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
                                IOOptionBits options) {
   struct igc_adapter *adapter = &priv_adapter;
 
-  if (!enabledForNetif || !linkUp || test_bit(__IGC_DOWN, &adapter->state))
+  diag.outputCalls++;
+  if (!enabledForNetif || !linkUp || test_bit(__IGC_DOWN, &adapter->state)) {
+    diag.outputNotReady++;
     return kIOReturnNotReady;
+  }
 
   struct igc_ring *tx_ring = igc_tx_queue_mapping(adapter, skb);
   mbuf_t skb = NULL;
@@ -6823,13 +6832,17 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
       skb = NULL;
       break;
     }
+    diag.outputFrames++;
   }
-  if ((txNumFreeDesc = igc_desc_unused(tx_ring)) >= (MAX_SKB_FRAGS + 3) &&
-      igc_tx_bounce_has_room(tx_ring, maxFrame)) {
-    return kIOReturnSuccess;
-  } else {
+  if ((txNumFreeDesc = igc_desc_unused(tx_ring)) < (MAX_SKB_FRAGS + 3)) {
+    diag.blockedOnDesc++;
     return kIOReturnNoResources;
   }
+  if (!igc_tx_bounce_has_room(tx_ring, maxFrame)) {
+    diag.blockedOnBounce++;
+    return kIOReturnNoResources;
+  }
+  return kIOReturnSuccess;
 }
 #endif
 
@@ -7382,13 +7395,19 @@ void AppleIGC::interruptOccurred(IOInterruptEventSource *src, int count) {
   irqCount++;
   igc_write_itr(q_vector);
   if (icr & IGC_ICR_DRSTA) {
+    diag.drstaEvents++;
     requestReset();
   }
 
   if (icr & IGC_ICR_DOUTSYNC) {
     /* HW is reporting DMA is out of sync */
     adapter->stats.doosync++;
+    diag.doutsyncEvents++;
   }
+  if (icr & IGC_ICR_LSC)
+    diag.lscEvents++;
+  if (icr & IGC_ICR_RXSEQ)
+    diag.rxseqEvents++;
   if (unlikely(icr & (IGC_ICR_RXSEQ | IGC_ICR_LSC))) {
     /* Link work takes the adapter down and up, so leave it to the watchdog.
      * Re-arming on every event could keep pushing its deadline back. */
@@ -7427,8 +7446,10 @@ void AppleIGC::watchdogTask() {
   if (status == 0xFFFFFFFF) {
     if (!pcieLost) {
       pcieLost = true;
+      diag.pcieLosses++;
       pr_err("PCIe device stopped responding (vendor id 0x%04x)\n",
              pdev->configRead16(kIOPCIConfigVendorID));
+      logHwState("PCIe device stopped responding");
     }
     return;
   }
@@ -7451,6 +7472,7 @@ void AppleIGC::watchdogTask() {
    * returns budget - 1 when it used the whole budget. */
   if (irqStalled) {
     for (i = 0; i < IGC_POLL_DRAIN_MAX; i++) {
+      diag.pollDrains++;
       if (igc_poll(adapter->q_vector[0], 64) != 63)
         break;
     }
@@ -7468,6 +7490,7 @@ void AppleIGC::watchdogTask() {
     if (irqCount == lastIrqCount) {
       if (!irqStalled) {
         irqStalled = true;
+        diag.irqStalls++;
         logHwState("no interrupts for a full period, polling (if this "
                    "repeats, try IGC_FORCE_INTX in Info.plist)");
         igc_irq_enable(adapter);
@@ -7505,32 +7528,148 @@ void AppleIGC::watchdogTask() {
 void AppleIGC::watchdogHandler(OSObject *target, IOTimerEventSource *src) {
   AppleIGC *me = (AppleIGC *)target;
   me->linkCheckPending = false;
+  me->diag.heartbeat++;
   me->watchdogTask();
-  if (me->enabledForNetif && !me->bSuspended)
+  if (me->enabledForNetif && !me->bSuspended) {
+    if (jiffies - me->diag.lastPublish >= IGC_DIAG_PERIOD)
+      me->publishDiagnostics();
     me->watchdogSource->setTimeoutMS(me->irqStalled ? IGC_WATCHDOG_POLL_MS
                                      : me->linkUp   ? IGC_WATCHDOG_UP_MS
                                                     : IGC_WATCHDOG_DOWN_MS);
+  }
 }
 
-void AppleIGC::logHwState(const char *why) {
+/* Reads no clear-on-read registers. Call only while the device is powered. */
+void AppleIGC::hwStateText(char *buf, size_t size) {
   struct igc_adapter *adapter = &priv_adapter;
   struct igc_hw *hw = &adapter->hw;
   struct igc_ring *tx = adapter->tx_ring[0];
   struct igc_ring *rx = adapter->rx_ring[0];
+  UInt8 cap = pcieCapOffset;
 
-  pr_err("%s: STATUS 0x%08x IMS 0x%08x irqs %u\n", why,
-         igc_peek(hw, IGC_STATUS), igc_peek(hw, IGC_IMS), irqCount);
-  pr_err("  TX head %u tail %u, sw clean %u use %u; RX head %u tail %u, sw "
-         "clean %u use %u\n",
-         igc_peek(hw, IGC_TDH(tx->reg_idx)), igc_peek(hw, IGC_TDT(tx->reg_idx)),
-         tx->next_to_clean, tx->next_to_use, igc_peek(hw, IGC_RDH(rx->reg_idx)),
-         igc_peek(hw, IGC_RDT(rx->reg_idx)), rx->next_to_clean,
-         rx->next_to_use);
+  snprintf(buf, size,
+           "STATUS=%08x IMS=%08x EITR=%08x TCTL=%08x RCTL=%08x "
+           "TX=%u/%u sw=%u/%u RX=%u/%u sw=%u/%u bounce=%u/%u "
+           "pci=%04x/%04x dev=%04x lnk=%04x/%04x",
+           igc_peek(hw, IGC_STATUS), igc_peek(hw, IGC_IMS),
+           igc_peek(hw, IGC_EITR(0)), igc_peek(hw, IGC_TCTL),
+           igc_peek(hw, IGC_RCTL), igc_peek(hw, IGC_TDH(tx->reg_idx)),
+           igc_peek(hw, IGC_TDT(tx->reg_idx)), tx->next_to_clean,
+           tx->next_to_use, igc_peek(hw, IGC_RDH(rx->reg_idx)),
+           igc_peek(hw, IGC_RDT(rx->reg_idx)), rx->next_to_clean,
+           rx->next_to_use, tx->tx_bounce_alloc - tx->tx_bounce_freed,
+           tx->tx_bounce_size, pdev->configRead16(kIOPCIConfigCommand),
+           pdev->configRead16(kIOPCIConfigStatus),
+           cap ? pdev->configRead16(cap + 0x0A) : 0,
+           cap ? pdev->configRead16(cap + 0x10) : 0,
+           cap ? pdev->configRead16(cap + 0x12) : 0);
+}
+
+void AppleIGC::logHwState(const char *why) {
+  char state[IGC_DIAG_STATE_LEN];
+
+  hwStateText(state, sizeof(state));
+  pr_err("%s: %s\n", why, state);
+
+  snprintf(diag.lastProblem, sizeof(diag.lastProblem), "t=%llus %s: %s",
+           (unsigned long long)(jiffies / 100), why, state);
+  if (!diag.firstProblem[0])
+    memcpy(diag.firstProblem, diag.lastProblem, sizeof(diag.firstProblem));
+}
+
+static void igc_diag_num(OSDictionary *dict, const char *key, UInt64 value) {
+  OSNumber *number = OSNumber::withNumber(value, 64);
+
+  if (number) {
+    dict->setObject(key, number);
+    number->release();
+  }
+}
+
+static void igc_diag_str(OSDictionary *dict, const char *key,
+                         const char *value) {
+  OSString *string = OSString::withCString(value);
+
+  if (string) {
+    dict->setObject(key, string);
+    string->release();
+  }
+}
+
+static void igc_diag_bool(OSDictionary *dict, const char *key, bool value) {
+  dict->setObject(key, value ? kOSBooleanTrue : kOSBooleanFalse);
+}
+
+/*
+ * Read it with: ioreg -r -c AppleIGC -l -w0 | grep IGCDiagnostics
+ * Runs on the work loop, about once a second.
+ */
+void AppleIGC::publishDiagnostics() {
+  struct igc_adapter *adapter = &priv_adapter;
+  OSDictionary *dict = OSDictionary::withCapacity(36);
+  char text[IGC_DIAG_STATE_LEN];
+  UInt64 now = jiffies;
+
+  if (!dict)
+    return;
+
+  diag.lastPublish = now;
+
+  snprintf(text, sizeof(text), "en%u", netif ? netif->getUnitNumber() : 0);
+  igc_diag_str(dict, "port", text);
+  igc_diag_num(dict, "uptime", now / 100);
+  igc_diag_num(dict, "heartbeat", diag.heartbeat);
+  igc_diag_str(dict, "irqMode", usingMsi ? "MSI" : "legacy");
+  igc_diag_bool(dict, "enabled", enabledForNetif);
+  igc_diag_bool(dict, "suspended", bSuspended);
+  igc_diag_bool(dict, "linkUp", linkUp);
+  igc_diag_bool(dict, "carrier", carrier());
+  igc_diag_bool(dict, "adapterDown", test_bit(__IGC_DOWN, &adapter->state));
+  igc_diag_bool(dict, "irqStalled", irqStalled);
+  igc_diag_bool(dict, "pcieLost", pcieLost);
+  igc_diag_num(dict, "speedMbps", adapter->link_speed);
+
+  igc_diag_num(dict, "irqs", irqCount);
+  igc_diag_num(dict, "irqStalls", diag.irqStalls);
+  igc_diag_num(dict, "pollDrains", diag.pollDrains);
+  igc_diag_num(dict, "lscEvents", diag.lscEvents);
+  igc_diag_num(dict, "rxseqEvents", diag.rxseqEvents);
+  igc_diag_num(dict, "drstaEvents", diag.drstaEvents);
+  igc_diag_num(dict, "doutsyncEvents", diag.doutsyncEvents);
+  igc_diag_num(dict, "txHangs", diag.txHangs);
+  igc_diag_num(dict, "resets", diag.resets);
+  igc_diag_num(dict, "linkUps", diag.linkUps);
+  igc_diag_num(dict, "linkDowns", diag.linkDowns);
+  igc_diag_num(dict, "pcieLosses", diag.pcieLosses);
+  igc_diag_num(dict, "txWakes", diag.txWakes);
+  igc_diag_num(dict, "outputCalls", diag.outputCalls);
+  igc_diag_num(dict, "outputFrames", diag.outputFrames);
+  igc_diag_num(dict, "outputNotReady", diag.outputNotReady);
+  igc_diag_num(dict, "blockedOnDesc", diag.blockedOnDesc);
+  igc_diag_num(dict, "blockedOnBounce", diag.blockedOnBounce);
+
+  if (enabledForNetif && !bSuspended) {
+    hwStateText(text, sizeof(text));
+    igc_diag_str(dict, "regs", text);
+  }
+  if (diag.firstProblem[0])
+    igc_diag_str(dict, "firstProblem", diag.firstProblem);
+  if (diag.lastProblem[0])
+    igc_diag_str(dict, "lastProblem", diag.lastProblem);
+
+  setProperty("IGCDiagnostics", dict);
+  dict->release();
 }
 
 void AppleIGC::requestReset() {
   if (resetSource)
     resetSource->setTimeoutMS(1);
+}
+
+void AppleIGC::reportTxHang() {
+  diag.txHangs++;
+  logHwState("TX hang");
+  requestReset();
 }
 
 void AppleIGC::resetAdapter() {
@@ -7540,6 +7679,7 @@ void AppleIGC::resetAdapter() {
   if (!enabledForNetif || bSuspended)
     return;
 
+  diag.resets++;
   logHwState("resetting adapter");
 
   /* Going through link down restores carrier, output and timers on the way
@@ -7625,6 +7765,7 @@ void AppleIGC::suspendAdapter() {
   resetSource->cancelTimeout();
   igc_down(&priv_adapter);
   igc_irq_disable(&priv_adapter);
+  publishDiagnostics();
 }
 
 /* Leaves the adapter down: the watchdog brings it up when the link returns. */
@@ -7752,6 +7893,7 @@ void AppleIGC::startTxQueue() {
     txMbufCursor =
         IOMbufNaturalMemoryCursor::withSpecification(0x4000, MAX_SKB_FRAGS);
   }
+  diag.txWakes++;
   netif->signalOutputThread();
 #endif
 }
