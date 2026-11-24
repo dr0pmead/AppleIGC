@@ -162,6 +162,8 @@ private:
   struct Diagnostics {
     UInt32 heartbeat;
     UInt32 irqStalls;
+    UInt32 irqRearms;
+    UInt32 irqResumes;
     UInt32 pollDrains;
     UInt32 lscEvents;
     UInt32 rxseqEvents;

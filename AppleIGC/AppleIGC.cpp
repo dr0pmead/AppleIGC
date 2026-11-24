@@ -406,7 +406,7 @@ static void igc_get_hw_control(struct igc_adapter *adapter) {
 
 #define IGC_WATCHDOG_UP_MS 1000
 #define IGC_WATCHDOG_DOWN_MS 500
-#define IGC_WATCHDOG_POLL_MS 1 /* while interrupts are not being delivered */
+#define IGC_WATCHDOG_POLL_US 250 /* while interrupts are not being delivered */
 #define IGC_POLL_DRAIN_MAX 8   /* polls per watchdog tick in that state */
 #define IGC_HEALTH_PERIOD 90   /* jiffies here are 10 ms */
 #define IGC_LINK_HOLDOFF 100   /* jiffies to ignore link-up after a reset */
@@ -7491,12 +7491,18 @@ void AppleIGC::watchdogTask() {
       if (!irqStalled) {
         irqStalled = true;
         diag.irqStalls++;
-        logHwState("no interrupts for a full period, polling (if this "
-                   "repeats, try IGC_FORCE_INTX in Info.plist)");
-        igc_irq_enable(adapter);
+        logHwState("no interrupts for a full period, polling");
       }
+      /* The NIC still asserts its interrupt when this happens, so it may be
+       * masked at the interrupt controller. Toggling the source unmasks the
+       * vector there; the next period shows whether delivery came back. */
+      interruptSource->disable();
+      interruptSource->enable();
+      diag.irqRearms++;
+      igc_irq_enable(adapter);
     } else if (irqStalled) {
       irqStalled = false;
+      diag.irqResumes++;
       pr_err("interrupts resumed\n");
     }
   }
@@ -7533,9 +7539,11 @@ void AppleIGC::watchdogHandler(OSObject *target, IOTimerEventSource *src) {
   if (me->enabledForNetif && !me->bSuspended) {
     if (jiffies - me->diag.lastPublish >= IGC_DIAG_PERIOD)
       me->publishDiagnostics();
-    me->watchdogSource->setTimeoutMS(me->irqStalled ? IGC_WATCHDOG_POLL_MS
-                                     : me->linkUp   ? IGC_WATCHDOG_UP_MS
-                                                    : IGC_WATCHDOG_DOWN_MS);
+    if (me->irqStalled)
+      me->watchdogSource->setTimeoutUS(IGC_WATCHDOG_POLL_US);
+    else
+      me->watchdogSource->setTimeoutMS(me->linkUp ? IGC_WATCHDOG_UP_MS
+                                                  : IGC_WATCHDOG_DOWN_MS);
   }
 }
 
@@ -7606,7 +7614,7 @@ static void igc_diag_bool(OSDictionary *dict, const char *key, bool value) {
  */
 void AppleIGC::publishDiagnostics() {
   struct igc_adapter *adapter = &priv_adapter;
-  OSDictionary *dict = OSDictionary::withCapacity(36);
+  OSDictionary *dict = OSDictionary::withCapacity(56);
   char text[IGC_DIAG_STATE_LEN];
   UInt64 now = jiffies;
 
@@ -7631,6 +7639,8 @@ void AppleIGC::publishDiagnostics() {
 
   igc_diag_num(dict, "irqs", irqCount);
   igc_diag_num(dict, "irqStalls", diag.irqStalls);
+  igc_diag_num(dict, "irqRearms", diag.irqRearms);
+  igc_diag_num(dict, "irqResumes", diag.irqResumes);
   igc_diag_num(dict, "pollDrains", diag.pollDrains);
   igc_diag_num(dict, "lscEvents", diag.lscEvents);
   igc_diag_num(dict, "rxseqEvents", diag.rxseqEvents);
@@ -7647,6 +7657,28 @@ void AppleIGC::publishDiagnostics() {
   igc_diag_num(dict, "outputNotReady", diag.outputNotReady);
   igc_diag_num(dict, "blockedOnDesc", diag.blockedOnDesc);
   igc_diag_num(dict, "blockedOnBounce", diag.blockedOnBounce);
+
+  /* Hardware counters since the driver started, read every health period.
+   * Pause frames, LPI and errors are the suspects for slow 2.5G upload. */
+  igc_diag_num(dict, "pauseRxXon", adapter->stats.xonrxc);
+  igc_diag_num(dict, "pauseRxXoff", adapter->stats.xoffrxc);
+  igc_diag_num(dict, "pauseTxXon", adapter->stats.xontxc);
+  igc_diag_num(dict, "pauseTxXoff", adapter->stats.xofftxc);
+  igc_diag_num(dict, "fcMode", adapter->hw.fc.current_mode);
+  igc_diag_num(dict, "crcErrors", adapter->stats.crcerrs);
+  igc_diag_num(dict, "lengthErrors", adapter->stats.rlec);
+  igc_diag_num(dict, "missedPackets", adapter->stats.mpc);
+  igc_diag_num(dict, "rxNoBuffer", adapter->stats.rnbc);
+  igc_diag_num(dict, "lateCollisions", adapter->stats.latecol);
+  igc_diag_num(dict, "deferred", adapter->stats.dc);
+  igc_diag_num(dict, "lpiTx", adapter->stats.tlpic);
+  igc_diag_num(dict, "lpiRx", adapter->stats.rlpic);
+  igc_diag_num(dict, "goodTxPackets", adapter->stats.gptc);
+  igc_diag_num(dict, "goodRxPackets", adapter->stats.gprc);
+  if (enabledForNetif && !bSuspended && !pcieLost) {
+    igc_diag_num(dict, "eeer", igc_peek(&adapter->hw, IGC_EEER));
+    igc_diag_num(dict, "ipcnfg", igc_peek(&adapter->hw, IGC_IPCNFG));
+  }
 
   if (enabledForNetif && !bSuspended) {
     hwStateText(text, sizeof(text));
@@ -8076,10 +8108,11 @@ bool AppleIGC::initEventSources(IOService *provider) {
   }
   transmitQueue->retain();
 #endif
-  /* Source 0 is usually the legacy INTx line, which can miss interrupts under
-   * sustained traffic. IGC_FORCE_INTX in Info.plist keeps it for testing. */
+  /* Source 0 is the legacy INTx line. On an Arrow Lake i226 with VT-d, MSI
+   * was never delivered at all, while INTx worked until it stalled, so INTx
+   * is the default. Set IGC_FORCE_INTX to false in Info.plist to try MSI. */
   usingMsi = false;
-  if (!getBoolOption("IGC_FORCE_INTX", false)) {
+  if (!getBoolOption("IGC_FORCE_INTX", true)) {
     for (int index = 0;
          provider->getInterruptType(index, &interruptType) == kIOReturnSuccess;
          index++) {

@@ -21,7 +21,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IGC_FORCE_INTX</key>
-			<false/>
+			<true/>
 			<key>NETIF_F_TSO</key>
 			<false/>
 		</dict>
@@ -38,7 +38,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IGC_FORCE_INTX</key>
-			<false/>
+			<true/>
 			<key>NETIF_F_TSO</key>
 			<true/>
 		</dict>
