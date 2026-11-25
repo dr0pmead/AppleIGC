@@ -399,10 +399,16 @@ static void igc_get_hw_control(struct igc_adapter *adapter) {
 }
 
 #define IGC_DESC_RING_ALIGN 128
-#define IGC_TX_BOUNCE_SIZE (256 * 1024)
+#define IGC_TX_BOUNCE_SIZE (1024 * 1024)
 #define IGC_TX_BOUNCE_MIN_SIZE (64 * 1024)
 #define IGC_TX_BOUNCE_ALIGN 64
 #define IGC_TX_BOUNCE_MAX_FRAME (65536 + ETH_HLEN + VLAN_HLEN)
+
+/* Without TSO every frame is one bounce segment: a context descriptor and one
+ * data descriptor. 256 descriptors with the TSO-sized reserve of
+ * MAX_SKB_FRAGS + 3 left about 86 frames in flight, which ran dry at 2.5G. */
+#define IGC_APPLE_TXD 1024
+#define IGC_TX_BOUNCE_DESC_NEEDED 6 /* context + data + igc_tx_map's gap of 3 */
 
 #define IGC_WATCHDOG_UP_MS 1000
 #define IGC_WATCHDOG_DOWN_MS 500
@@ -4422,7 +4428,7 @@ static int igc_sw_init(struct igc_adapter *adapter) {
   AppleIGC *netdev = adapter->netdev;
 
   /* set default ring sizes */
-  adapter->tx_ring_count = IGC_DEFAULT_TXD;
+  adapter->tx_ring_count = IGC_APPLE_TXD;
   adapter->rx_ring_count = IGC_DEFAULT_RXD;
 
   /* set default ITR values */
@@ -6127,12 +6133,20 @@ bool AppleIGC::igc_probe() {
   adapter->reset_task = resetSource;
 
   /* Initialize link properties that are user-changeable */
-  adapter->fc_autoneg = true;
   hw->mac.autoneg = true;
   hw->phy.autoneg_advertised = 0xaf;
 
-  hw->fc.requested_mode = igc_fc_default;
-  hw->fc.current_mode = igc_fc_default;
+  /* IGC_FLOW_CONTROL=false stops advertising and honouring pause frames */
+  if (getBoolOption("IGC_FLOW_CONTROL", true)) {
+    adapter->fc_autoneg = true;
+    hw->fc.requested_mode = igc_fc_default;
+    hw->fc.current_mode = igc_fc_default;
+  } else {
+    pr_err("flow control disabled by IGC_FLOW_CONTROL\n");
+    adapter->fc_autoneg = false;
+    hw->fc.requested_mode = igc_fc_none;
+    hw->fc.current_mode = igc_fc_none;
+  }
 
   /* By default, support wake on port A */
   adapter->flags |= IGC_FLAG_WOL_SUPPORTED;
@@ -6747,7 +6761,8 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
   /* checked before dequeueing: a dequeued frame cannot be handed back */
   u32 maxFrame = useTSO ? IGC_TX_BOUNCE_MAX_FRAME
                         : _mtu + ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN;
-  while ((txNumFreeDesc = igc_desc_unused(tx_ring)) >= (MAX_SKB_FRAGS + 3) &&
+  u32 descNeeded = useTSO ? (MAX_SKB_FRAGS + 3) : IGC_TX_BOUNCE_DESC_NEEDED;
+  while ((txNumFreeDesc = igc_desc_unused(tx_ring)) >= descNeeded &&
          igc_tx_bounce_has_room(tx_ring, maxFrame) &&
          kIOReturnSuccess ==
              interface->dequeueOutputPackets(1, &skb, NULL, NULL, NULL)) {
@@ -6834,7 +6849,7 @@ IOReturn AppleIGC::outputStart(IONetworkInterface *interface,
     }
     diag.outputFrames++;
   }
-  if ((txNumFreeDesc = igc_desc_unused(tx_ring)) < (MAX_SKB_FRAGS + 3)) {
+  if ((txNumFreeDesc = igc_desc_unused(tx_ring)) < descNeeded) {
     diag.blockedOnDesc++;
     return kIOReturnNoResources;
   }
@@ -7614,7 +7629,7 @@ static void igc_diag_bool(OSDictionary *dict, const char *key, bool value) {
  */
 void AppleIGC::publishDiagnostics() {
   struct igc_adapter *adapter = &priv_adapter;
-  OSDictionary *dict = OSDictionary::withCapacity(56);
+  OSDictionary *dict = OSDictionary::withCapacity(60);
   char text[IGC_DIAG_STATE_LEN];
   UInt64 now = jiffies;
 
@@ -7657,6 +7672,10 @@ void AppleIGC::publishDiagnostics() {
   igc_diag_num(dict, "outputNotReady", diag.outputNotReady);
   igc_diag_num(dict, "blockedOnDesc", diag.blockedOnDesc);
   igc_diag_num(dict, "blockedOnBounce", diag.blockedOnBounce);
+  if (adapter->tx_ring[0]) {
+    igc_diag_num(dict, "txRing", adapter->tx_ring[0]->count);
+    igc_diag_num(dict, "txBounce", adapter->tx_ring[0]->tx_bounce_size);
+  }
 
   /* Hardware counters since the driver started, read every health period.
    * Pause frames, LPI and errors are the suspects for slow 2.5G upload. */

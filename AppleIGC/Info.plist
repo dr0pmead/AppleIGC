@@ -20,6 +20,8 @@
 			<integer>4000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
+			<key>IGC_FLOW_CONTROL</key>
+			<true/>
 			<key>IGC_FORCE_INTX</key>
 			<true/>
 			<key>NETIF_F_TSO</key>
@@ -37,6 +39,8 @@
 			<integer>4000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
+			<key>IGC_FLOW_CONTROL</key>
+			<true/>
 			<key>IGC_FORCE_INTX</key>
 			<true/>
 			<key>NETIF_F_TSO</key>
